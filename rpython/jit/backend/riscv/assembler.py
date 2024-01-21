@@ -86,6 +86,7 @@ class AssemblerRISCV(OpAssembler):
                                                    operations)
         frame_depth = frame_depth_no_fixed_size + JITFRAME_FIXED_SIZE
         self.update_frame_depth(frame_depth)
+        self.patch_frame_depth_checks(frame_depth)
 
         size_excluding_failure_stuff = self.mc.get_relative_pos()
 
@@ -97,13 +98,15 @@ class AssemblerRISCV(OpAssembler):
         _emit_nop_until_larger(self.mc, self.mc.get_relative_pos(),
                                function_pos + _REDIRECT_BRANCH_STUB_SIZE)
 
+        const_pos = self.mc.get_relative_pos()
+        self.mc.emit_pending_constants()
+
         full_size = self.mc.get_relative_pos()
         rawstart = self.materialize_loop(looptoken)
         looptoken._ll_function_addr = rawstart + function_pos
 
         self.patch_gcref_table(looptoken, rawstart)
         self.process_pending_guards(rawstart)
-        self.patch_frame_depth_checks(frame_depth, rawstart)
         self.fixup_target_tokens(rawstart)
 
         if log and not we_are_translated():
@@ -133,6 +136,7 @@ class AssemblerRISCV(OpAssembler):
         debug_print('         resops: 0x%x' % r_uint(rawstart + loop_head))
         debug_print('       failures: 0x%x' % r_uint(rawstart +
                                                  size_excluding_failure_stuff))
+        debug_print("     const pool: 0x%x" % r_uint(rawstart + const_pos))
         debug_print('            end: 0x%x' % r_uint(rawstart + full_size))
         debug_stop('jit-backend-addr')
 
@@ -177,17 +181,20 @@ class AssemblerRISCV(OpAssembler):
         frame_depth = max(self.current_clt.frame_info.jfi_frame_depth,
                           bridge_frame_depth)
         self.update_frame_depth(frame_depth)
+        self.patch_frame_depth_checks(bridge_frame_depth)
 
         code_end_pos = self.mc.get_relative_pos()
 
         self.write_pending_failure_recoveries()
+
+        const_pos = self.mc.get_relative_pos()
+        self.mc.emit_pending_constants()
 
         fullsize = self.mc.get_relative_pos()
         rawstart = self.materialize_loop(original_loop_token)
 
         self.patch_gcref_table(original_loop_token, rawstart)
         self.process_pending_guards(rawstart)
-        self.patch_frame_depth_checks(bridge_frame_depth, rawstart)
         self.fixup_target_tokens(rawstart)
 
         if log and not we_are_translated():
@@ -218,6 +225,7 @@ class AssemblerRISCV(OpAssembler):
         debug_print("         resops: 0x%x" % r_uint(rawstart +
                                                      bridge_start_pos))
         debug_print("       failures: 0x%x" % r_uint(rawstart + code_end_pos))
+        debug_print("     const pool: 0x%x" % r_uint(rawstart + const_pos))
         debug_print("            end: 0x%x" % r_uint(rawstart + fullsize))
         debug_stop("jit-backend-addr")
 
@@ -248,6 +256,7 @@ class AssemblerRISCV(OpAssembler):
         scratch_reg = r.x31  # Pick a caller-saved reg excluding x10-17 & ra
         mc.load_int_imm(scratch_reg.value, target)
         mc.JALR(r.x0.value, scratch_reg.value, 0)
+        mc.emit_pending_constants()
         mc.copy_to_raw_memory(oldadr)
 
         jl.redirect_assembler(oldlooptoken, newlooptoken, newlooptoken.number)
@@ -711,7 +720,9 @@ class AssemblerRISCV(OpAssembler):
         assert patch_addr != 0
 
         pmc = InstrBuilder()
-        pmc.jal_abs(r.zero.value, bridge_addr)
+        pmc.load_int_imm(r.x31.value, bridge_addr)
+        pmc.JR(r.x31.value)
+        pmc.emit_pending_constants()
         pmc.copy_to_raw_memory(patch_addr)
 
         faildescr.adr_jump_offset = 0
@@ -855,6 +866,7 @@ class AssemblerRISCV(OpAssembler):
             mc.store_int(r.x0.value, scratch_reg.value, 0)
 
         self._call_footer(mc)
+        mc.emit_pending_constants()
 
         rawstart = mc.materialize(self.cpu, [])
         self.failure_recovery_code[exc + 2 * withfloats] = rawstart
@@ -973,6 +985,7 @@ class AssemblerRISCV(OpAssembler):
             mc.ANDI(r.x31.value, r.x31.value, 0x80)
 
         mc.RET()
+        mc.emit_pending_constants()
 
         rawstart = mc.materialize(self.cpu, [])
         if for_frame:
@@ -1056,6 +1069,7 @@ class AssemblerRISCV(OpAssembler):
 
         # Return
         mc.RET()
+        mc.emit_pending_constants()
 
         rawstart = mc.materialize(self.cpu, [])
         self._frame_realloc_slowpath = rawstart
@@ -1077,8 +1091,8 @@ class AssemblerRISCV(OpAssembler):
         # Load the target for the frame depth.
         if expected_size == -1:
             stack_check_cmp_ofs = mc.get_relative_pos()
-            for _ in range(MAX_NUM_INSTS_FOR_LOAD_INT_IMM):
-                mc.NOP()
+            mc.EBREAK()  # Patch Location: LOAD_INT scratch_reg, expected_size
+            mc.NOP()
             self._frame_depth_to_patch.append(stack_check_cmp_ofs)
         else:
             mc.load_int_imm(scratch_reg.value, expected_size)
@@ -1116,11 +1130,10 @@ class AssemblerRISCV(OpAssembler):
         gcmap = self._regalloc.get_gcmap()
         self._check_frame_depth(self.mc, gcmap, expected_size)
 
-    def patch_frame_depth_checks(self, frame_depth, rawstart):
+    def patch_frame_depth_checks(self, frame_depth):
         for ofs in self._frame_depth_to_patch:
-            mc = InstrBuilder()
-            mc.load_int_imm(r.x31.value, frame_depth)
-            mc.copy_to_raw_memory(ofs + rawstart)
+            pmc = OverwritingBuilder(self.mc, ofs, INST_SIZE * 2)
+            pmc.load_int_imm(r.x31.value, frame_depth)
 
     def update_frame_depth(self, frame_depth):
         baseofs = self.cpu.get_baseofs_of_frame_field()
@@ -1213,6 +1226,7 @@ class AssemblerRISCV(OpAssembler):
         mc.store_int(scratch_reg.value, r.jfp.value, ofs)
 
         self._call_footer(mc)
+        mc.emit_pending_constants()
 
         rawstart = mc.materialize(self.cpu, [])
         self.propagate_exception_path = rawstart
@@ -1248,6 +1262,7 @@ class AssemblerRISCV(OpAssembler):
                                          supports_floats,
                                          callee_only)  # Restores r.ra
         mc.RET()
+        mc.emit_pending_constants()
         return mc.materialize(self.cpu, [])
 
     def _reload_frame_if_necessary(self, mc, tmplocs):
@@ -1371,6 +1386,7 @@ class AssemblerRISCV(OpAssembler):
         mc.store_int(r.x0.value, r.jfp.value, jf_gcmap_ofs)
 
         mc.RET()
+        mc.emit_pending_constants()
 
         rawstart = mc.materialize(self.cpu, [])
         return rawstart
@@ -1604,15 +1620,10 @@ class AssemblerRISCV(OpAssembler):
         mc.ADDI(r.sp.value, r.sp.value, stack_size)
         mc.load_int_imm(r.ra.value, self.propagate_exception_path)
         mc.JR(r.ra.value)
+        mc.emit_pending_constants()
 
         rawstart = mc.materialize(self.cpu, [])
         self.stack_check_slowpath = rawstart
-
-    def _load_fp_imm(self, loc, imm):
-        """Load a float immediate value to a fp register."""
-        # TODO: Switch to pc-relative addressing
-        self.mc.load_int_imm(r.x31.value, imm.get_addr())
-        self.mc.load_float(loc.value, r.x31.value, 0)
 
     def load_imm(self, loc, imm):
         """Load an immediate value into a register"""
@@ -1621,7 +1632,7 @@ class AssemblerRISCV(OpAssembler):
             self.mc.load_int_imm(loc.value, imm.value)
         else:
             assert loc.is_fp_reg() and imm.is_imm_float()
-            self._load_fp_imm(loc, imm)
+            self.mc.load_float_imm(loc.value, imm.value)
 
     def regalloc_mov(self, prev_loc, loc):
         """Moves a value from a previous location to some other location"""
@@ -1675,9 +1686,9 @@ class AssemblerRISCV(OpAssembler):
 
     def _mov_imm_float_to_loc(self, prev_loc, loc):
         if loc.is_fp_reg():
-            self._load_fp_imm(loc, prev_loc)
+            self.mc.load_float_imm(loc.value, prev_loc.value)
         elif loc.is_stack():
-            self._load_fp_imm(r.f31, prev_loc)
+            self.mc.load_float_imm(r.f31.value, prev_loc.value)
             self.mc.store_float(r.f31.value, r.jfp.value, loc.value)
         else:
             assert 0, 'unsupported case'
